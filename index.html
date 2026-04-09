@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Job Search Dashboard</title>
+<meta name="description" content="Job Search Dashboard — LinkedIn, Google Jobs, Adzuna + JSearch API">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+<style>html,body,#root{margin:0;padding:0;height:100%}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ─── API Configuration ───
+// ⚠️ REPLACE these with your real keys
+const API_CONFIG = {
+  adzuna: {
+    appId: "9e9603ad",
+    appKey: "e1c7476d49dc06a952c26fc65176fc57",
+  },
+  jsearch: {
+    apiKey: "9923dc7d6emsh87b23f31ae34f27p1cab5fjsn62dee807eb53",
+  }
+};
+
+// ─── Adzuna API (JSONP to bypass CORS — works from any domain) ───
+function searchAdzunaJSONP(query, location, page = 1) {
+  return new Promise((resolve, reject) => {
+    const { appId, appKey } = API_CONFIG.adzuna;
+    const cbName = '_adzCb' + Math.random().toString(36).substr(2, 8);
+    const timeout = setTimeout(() => { cleanup(); resolve([]); }, 8000);
+
+    function cleanup() {
+      clearTimeout(timeout);
+      delete window[cbName];
+      const el = document.getElementById(cbName);
+      if (el) el.remove();
+    }
+
+    window[cbName] = function(data) {
+      cleanup();
+      try {
+        resolve((data.results || []).map(job => ({
+          id: 'az_' + job.id,
+          title: job.title,
+          company: job.company?.display_name || 'Unknown',
+          location: job.location?.display_name || '',
+          type: job.contract_type === 'permanent' ? 'Full-time' :
+                job.contract_type === 'contract' ? 'Contract' : 'Full-time',
+          salary: job.salary_min && job.salary_max
+            ? `₹${Math.round(job.salary_min/100000)}L–₹${Math.round(job.salary_max/100000)}L`
+            : '',
+          description: (job.description || '').substring(0, 200),
+          fullDesc: job.description || '',
+          skills: [],
+          posted: job.created?.split('T')[0] || '',
+          source: 'Adzuna',
+          applyLink: job.redirect_url,
+          logo: (job.company?.display_name || 'UN').substring(0, 2).toUpperCase(),
+          color: '#2563eb',
+          match: 0,
+          recruiter: null,
+        })));
+      } catch(e) { resolve([]); }
+    };
+
+    const url = `https://api.adzuna.com/v1/api/jobs/in/search/${page}?` +
+      `app_id=${appId}&app_key=${appKey}` +
+      `&results_per_page=10` +
+      `&what=${encodeURIComponent(query)}` +
+      (location ? `&where=${encodeURIComponent(location)}` : '') +
+      `&sort_by=date` +
+      `&content-type=application/javascript` +
+      `&callback=${cbName}`;
+
+    const script = document.createElement('script');
+    script.id = cbName;
+    script.src = url;
+    script.onerror = () => { cleanup(); resolve([]); };
+    document.head.appendChild(script);
+  });
+}
+
+// ─── JSearch API (Google Jobs / LinkedIn / Indeed) ───
+async function searchJSearch(query, location, datePosted = 'all') {
+  const url = `https://jsearch.p.rapidapi.com/search?` +
+    `query=${encodeURIComponent(query + (location ? ' in ' + location : ''))}` +
+    `&page=1&num_pages=1` +
+    `&date_posted=${datePosted}`;
+  const res = await fetch(url, {
+    headers: {
+      'X-RapidAPI-Key': API_CONFIG.jsearch.apiKey,
+      'X-RapidAPI-Host': 'jsearch.p.rapidapi.com'
+    }
+  });
+  const data = await res.json();
+  return (data.data || []).map(job => ({
+    id: 'js_' + job.job_id,
+    title: job.job_title,
+    company: job.employer_name,
+    location: [job.job_city, job.job_state, job.job_country]
+      .filter(Boolean).join(', '),
+    type: job.job_employment_type === 'FULLTIME' ? 'Full-time' :
+          job.job_employment_type === 'PARTTIME' ? 'Part-time' :
+          job.job_employment_type === 'CONTRACTOR' ? 'Contract' :
+          job.job_employment_type || 'Full-time',
+    salary: job.job_min_salary && job.job_max_salary
+      ? `₹${Math.round(job.job_min_salary/100000)}L–₹${Math.round(job.job_max_salary/100000)}L`
+      : '',
+    description: (job.job_description || '').substring(0, 200),
+    fullDesc: job.job_description || '',
+    skills: job.job_required_skills || [],
+    posted: job.job_posted_at_datetime_utc?.split('T')[0] || '',
+    source: job.job_publisher || 'Google Jobs',
+    applyLink: job.job_apply_link,
+    logo: (job.employer_name || 'UN').substring(0, 2).toUpperCase(),
+    color: job.job_publisher === 'LinkedIn' ? '#0a66c2' : '#4285f4',
+    match: 0,
+    recruiter: null,
+  }));
+}
+
+// ─── Combined Search ───
+async function searchAllAPIs(query, location, datePosted) {
+  const jsearchDate = {
+    'any': 'all', '24h': 'today', '3d': '3days',
+    'week': 'week', 'month': 'month'
+  }[datePosted] || 'all';
+  const [adzunaResults, jsearchResults] = await Promise.allSettled([
+    searchAdzunaJSONP(query, location),
+    searchJSearch(query, location, jsearchDate),
+  ]);
+  const results = [
+    ...(adzunaResults.status === 'fulfilled' ? adzunaResults.value : []),
+    ...(jsearchResults.status === 'fulfilled' ? jsearchResults.value : []),
+  ];
+  const seen = new Set();
+  return results.filter(job => {
+    const key = (job.title + job.company).toLowerCase().replace(/\s/g, '');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// ─── Sample Data — LinkedIn & Google Jobs sources only, with recruiter contacts ──
+const SAMPLE_JOBS = [
+  { id:1, title:"Senior Frontend Developer", company:"TechNova Labs", location:"Bangalore, IN", type:"Full-time", salary:"₹18L–₹28L", description:"Build next-generation web applications using React, TypeScript, and modern tooling. Lead a team of 4 developers.", skills:["React","TypeScript","Node.js","GraphQL","AWS"], posted:"2026-04-07", source:"LinkedIn", logo:"TN", color:"#2563eb", match:92, recruiter:{name:"Priya Menon",title:"Talent Acquisition Lead",email:"priya.menon@technovalabs.com",linkedin:"linkedin.com/in/priyamenon",phone:"+91 98451 12345"}, fullDesc:"We are looking for a Senior Frontend Developer to join our growing engineering team.\n\nResponsibilities:\n• Architect and build performant React applications\n• Collaborate with product and design teams\n• Code review and mentoring\n• Drive adoption of best practices\n\nRequirements:\n• 5+ years of frontend development experience\n• Expert-level React and TypeScript\n• Experience with state management (Redux, Zustand)\n• Strong understanding of web performance optimization" },
+  { id:2, title:"Product Manager", company:"Flipkart", location:"Bangalore, IN", type:"Full-time", salary:"₹22L–₹35L", description:"Drive product strategy for Flipkart's seller platform. Work with engineering and design to launch features.", skills:["Product Strategy","Analytics","SQL","A/B Testing","Agile"], posted:"2026-04-08", source:"Google Jobs", logo:"FK", color:"#f97316", match:78, recruiter:{name:"Rahul Kapoor",title:"Senior Recruiter",email:"rahul.kapoor@flipkart.com",linkedin:"linkedin.com/in/rahulkapoor-fk",phone:"+91 99001 67890"}, fullDesc:"Flipkart is seeking an experienced Product Manager to own the seller experience platform.\n\nWhat you'll do:\n• Define and execute product roadmap for seller tools\n• Analyze user data to identify opportunities\n• Run A/B experiments to validate hypotheses\n• Partner with engineering, design, and business teams\n\nWhat we need:\n• 4+ years of product management experience\n• Strong analytical skills with SQL proficiency\n• E-commerce or marketplace experience preferred" },
+  { id:3, title:"Data Scientist", company:"Razorpay", location:"Pune, IN", type:"Full-time", salary:"₹20L–₹32L", description:"Apply ML models to detect fraud, optimize payment routing, and improve merchant experience.", skills:["Python","ML","TensorFlow","SQL","Statistics"], posted:"2026-04-06", source:"LinkedIn", logo:"RP", color:"#10b981", match:65, recruiter:{name:"Ananya Desai",title:"HR Business Partner",email:"ananya.d@razorpay.com",linkedin:"linkedin.com/in/ananya-desai-rp"}, fullDesc:"Join Razorpay's data science team to build ML models that power India's largest payment gateway.\n\nKey areas:\n• Build and deploy ML models for fraud detection\n• Optimize payment routing algorithms\n• Create merchant segmentation and scoring models\n\nRequirements:\n• MS/PhD in CS, Statistics, or related field\n• 3+ years of applied ML experience\n• Proficiency in Python, TensorFlow/PyTorch" },
+  { id:4, title:"UX Designer", company:"Swiggy", location:"Remote", type:"Remote", salary:"₹12L–₹20L", description:"Design intuitive user experiences for food delivery and quick-commerce platforms.", skills:["Figma","User Research","Prototyping","Design Systems","Usability Testing"], posted:"2026-04-04", source:"Google Jobs", logo:"SW", color:"#ef4444", match:45, recruiter:{name:"Kavita Sharma",title:"Talent Partner – Design",email:"kavita.sharma@swiggy.in",linkedin:"linkedin.com/in/kavitasharma-sw"}, fullDesc:"Swiggy is looking for a UX Designer to shape the future of food delivery experiences.\n\nWhat you'll do:\n• Design end-to-end user experiences for Swiggy apps\n• Conduct user research and usability testing\n• Build and maintain design system components\n\nRequirements:\n• 3+ years of UX design experience\n• Expert in Figma and prototyping tools\n• Portfolio demonstrating user-centered design" },
+  { id:5, title:"DevOps Engineer", company:"Zomato", location:"Gurugram, IN", type:"Full-time", salary:"₹16L–₹26L", description:"Build and maintain CI/CD pipelines, manage Kubernetes clusters, and ensure 99.99% uptime.", skills:["Kubernetes","Docker","AWS","Terraform","Jenkins"], posted:"2026-04-02", source:"LinkedIn", logo:"ZM", color:"#e11d48", match:70, recruiter:{name:"Vikram Joshi",title:"Engineering Recruiter",email:"vikram.joshi@zomato.com",linkedin:"linkedin.com/in/vikramjoshi-zm",phone:"+91 88765 43210"}, fullDesc:"Zomato's infrastructure team needs a DevOps Engineer to scale our systems serving 100M+ users.\n\nResponsibilities:\n• Manage and scale Kubernetes clusters\n• Build CI/CD pipelines for 200+ microservices\n• Implement infrastructure as code with Terraform\n\nRequirements:\n• 4+ years of DevOps/SRE experience\n• Strong Kubernetes and Docker expertise\n• AWS/GCP cloud platform experience" },
+  { id:6, title:"Sales Manager – FMCG", company:"Marico Ltd", location:"Mumbai, IN", type:"Full-time", salary:"₹14L–₹22L", description:"Lead general trade and modern trade sales operations across Western India. Drive distribution expansion.", skills:["Sales Strategy","Distribution","Trade Marketing","Team Management","FMCG"], posted:"2026-04-05", source:"LinkedIn", logo:"ML", color:"#8b5cf6", match:88, recruiter:{name:"Sneha Patil",title:"Head – Talent Acquisition",email:"sneha.patil@marico.com",linkedin:"linkedin.com/in/snehapatil-marico",phone:"+91 97654 32100"}, fullDesc:"Marico is hiring a Sales Manager to lead trade channel operations in Western India.\n\nResponsibilities:\n• Drive primary and secondary sales targets\n• Expand distribution in general trade\n• Manage modern trade relationships\n• Lead and develop a team of 15+ field staff\n\nRequirements:\n• 5+ years in FMCG sales\n• Experience with GT/MT channel management\n• Strong understanding of distribution economics" },
+  { id:7, title:"Full Stack Developer", company:"Atlassian", location:"Bangalore, IN", type:"Full-time", salary:"₹25L–₹42L", description:"Build enterprise collaboration tools used by millions. Work on Jira, Confluence, or Trello's core platform.", skills:["Java","React","PostgreSQL","Microservices","REST APIs"], posted:"2026-04-03", source:"Google Jobs", logo:"AT", color:"#0052cc", match:82, recruiter:{name:"Deepak Nair",title:"Tech Recruiter",email:"deepak.nair@atlassian.com",linkedin:"linkedin.com/in/deepaknair-atlassian"}, fullDesc:"Atlassian is looking for Full Stack Developers to build the future of teamwork.\n\nWhat you'll do:\n• Design and implement features for Jira/Confluence\n• Build scalable microservices architecture\n• Write clean, tested, well-documented code\n\nRequirements:\n• 4+ years of full stack development\n• Proficiency in Java and React\n• Experience with distributed systems" },
+  { id:8, title:"Marketing Analyst", company:"PhonePe", location:"Bangalore, IN", type:"Contract", salary:"₹10L–₹16L", description:"Analyze marketing campaigns, optimize CAC, and build dashboards for India's leading UPI platform.", skills:["Google Analytics","SQL","Excel","Tableau","Campaign Management"], posted:"2026-04-06", source:"LinkedIn", logo:"PP", color:"#6366f1", match:60, recruiter:{name:"Meghna Iyer",title:"People Operations",email:"meghna.iyer@phonepe.com",linkedin:"linkedin.com/in/meghnaiyer-pp"}, fullDesc:"PhonePe is looking for a Marketing Analyst to drive data-informed decisions.\n\nResponsibilities:\n• Analyze marketing campaign performance\n• Build and maintain marketing dashboards\n• Optimize customer acquisition cost\n\nRequirements:\n• 2+ years of marketing analytics experience\n• Strong SQL and Excel skills\n• Experience with BI tools (Tableau/PowerBI)" },
+  { id:9, title:"Operations Manager – E-commerce", company:"Nykaa", location:"Mumbai, IN", type:"Full-time", salary:"₹15L–₹24L", description:"Manage end-to-end operations for beauty & personal care marketplace. Optimize fulfillment and vendor management.", skills:["Operations Management","Supply Chain","Vendor Management","Analytics","E-commerce"], posted:"2026-04-07", source:"Google Jobs", logo:"NK", color:"#ec4899", match:91, recruiter:{name:"Aisha Khan",title:"Senior Recruiter – Operations",email:"aisha.khan@nykaa.com",linkedin:"linkedin.com/in/aishakhan-nykaa",phone:"+91 90123 45678"}, fullDesc:"Nykaa is hiring an Operations Manager to optimize marketplace operations.\n\nResponsibilities:\n• Manage marketplace operations end-to-end\n• Optimize fulfillment and delivery performance\n• Build and manage vendor relationships\n\nRequirements:\n• 4+ years in e-commerce operations\n• Beauty/FMCG industry experience preferred\n• Strong analytical and problem-solving skills" },
+  { id:10, title:"Backend Engineer (Python)", company:"CRED", location:"Bangalore, IN", type:"Full-time", salary:"₹20L–₹35L", description:"Build high-scale backend services for India's premium fintech platform with Django and FastAPI.", skills:["Python","Django","FastAPI","PostgreSQL","Redis","Kafka"], posted:"2026-04-08", source:"LinkedIn", logo:"CR", color:"#1e293b", match:75, recruiter:{name:"Nikhil Verma",title:"Tech Talent Lead",email:"nikhil.v@cred.club",linkedin:"linkedin.com/in/nikhilverma-cred"}, fullDesc:"CRED is looking for Backend Engineers to build scalable systems.\n\nWhat you'll build:\n• High-throughput payment processing services\n• Event-driven microservices architecture\n• Real-time data pipelines\n\nRequirements:\n• 3+ years of Python backend development\n• Experience with Django/FastAPI\n• Knowledge of message queues (Kafka/RabbitMQ)" },
+  { id:11, title:"Content Strategist", company:"Freshworks", location:"Chennai, IN", type:"Remote", salary:"₹8L–₹14L", description:"Develop content strategy for SaaS products. Create compelling narratives for global B2B audiences.", skills:["Content Strategy","SEO","Copywriting","B2B Marketing","Analytics"], posted:"2026-04-02", source:"Google Jobs", logo:"FW", color:"#059669", match:50, recruiter:{name:"Lakshmi Rangan",title:"HR Manager",email:"lakshmi.r@freshworks.com",linkedin:"linkedin.com/in/lakshmirangan-fw"}, fullDesc:"Freshworks is seeking a Content Strategist for global content marketing.\n\nResponsibilities:\n• Develop and execute content strategy\n• Create blog posts, whitepapers, and case studies\n• Optimize content for SEO\n\nRequirements:\n• 3+ years in B2B content marketing\n• Strong writing and editing skills\n• SaaS industry experience preferred" },
+  { id:12, title:"Supply Chain Analyst", company:"Amazon India", location:"Hyderabad, IN", type:"Full-time", salary:"₹12L–₹20L", description:"Optimize last-mile delivery networks and inventory placement across fulfillment centers.", skills:["Supply Chain","SQL","Python","Forecasting","Operations Research"], posted:"2026-04-04", source:"LinkedIn", logo:"AZ", color:"#f59e0b", match:72, recruiter:{name:"Sanjay Reddy",title:"University Recruiting",email:"sanjreddy@amazon.com",linkedin:"linkedin.com/in/sanjayreddy-amz",phone:"+91 91234 56789"}, fullDesc:"Amazon India is hiring Supply Chain Analysts.\n\nWhat you'll do:\n• Analyze and optimize supply chain networks\n• Build demand forecasting models\n• Improve last-mile delivery efficiency\n\nRequirements:\n• 2+ years in supply chain analytics\n• Strong SQL and Python skills\n• Experience with forecasting and optimization" },
+  { id:13, title:"Mobile Developer (React Native)", company:"Dream11", location:"Mumbai, IN", type:"Full-time", salary:"₹18L–₹30L", description:"Build fantasy sports experiences for 200M+ users. Performance optimization and real-time features.", skills:["React Native","JavaScript","Redux","Native Modules","Performance"], posted:"2026-04-05", source:"Google Jobs", logo:"D11", color:"#dc2626", match:68, recruiter:{name:"Pooja Mehta",title:"Tech Recruiting Lead",email:"pooja.mehta@dream11.com",linkedin:"linkedin.com/in/poojamehta-d11"}, fullDesc:"Dream11 is looking for React Native developers.\n\nResponsibilities:\n• Build and optimize React Native mobile apps\n• Implement real-time score updates\n• Optimize app performance for millions of users\n\nRequirements:\n• 3+ years of React Native development\n• Experience with high-performance mobile apps\n• Knowledge of native iOS/Android development" },
+];
+
+const SAMPLE_RESUME = { personal:{name:"",email:"",phone:"",location:"",linkedin:"",summary:""}, experience:[], education:[], skills:[], certifications:[], languages:[] };
+const generateId = () => Math.random().toString(36).substr(2, 9);
+const fmtDate = () => new Date().toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"});
+
+const POSTED_OPTIONS = [{key:"any",label:"Any time"},{key:"24h",label:"Past 24 hours"},{key:"3d",label:"Past 3 days"},{key:"week",label:"Past week"},{key:"month",label:"Past month"}];
+function withinPosted(dateStr, key) {
+  if (key === "any") return true;
+  const d = (Date.now() - new Date(dateStr).getTime()) / 864e5;
+  return key === "24h" ? d <= 1 : key === "3d" ? d <= 3 : key === "week" ? d <= 7 : key === "month" ? d <= 30 : true;
+}
+function postedLabel(dateStr) {
+  const d = Math.floor((Date.now() - new Date(dateStr).getTime()) / 864e5);
+  return d === 0 ? "Today" : d === 1 ? "Yesterday" : d < 7 ? `${d} days ago` : d < 30 ? `${Math.floor(d/7)} week${Math.floor(d/7)>1?"s":""} ago` : `${Math.floor(d/30)} month${Math.floor(d/30)>1?"s":""} ago`;
+}
+
+// ─── Toast ───
+function Toasts({toasts,dismiss}){return(<div style={{position:"fixed",bottom:24,right:24,zIndex:9999,display:"flex",flexDirection:"column",gap:8}}>{toasts.map(t=>(<div key={t.id} onClick={()=>dismiss(t.id)} style={{padding:"12px 20px",borderRadius:12,color:"#fff",fontSize:13,fontWeight:500,boxShadow:"0 8px 32px rgba(0,0,0,.2)",cursor:"pointer",animation:"toastIn .35s cubic-bezier(.21,1.02,.73,1)",maxWidth:360,background:t.type==="success"?"#059669":t.type==="error"?"#dc2626":"#6366f1",display:"flex",alignItems:"center",gap:8}}><span>{t.type==="success"?"✓":t.type==="error"?"✕":"ℹ"}</span>{t.message}</div>))}</div>);}
+
+// ─── Recruiter Contact Card ───
+function RecruiterCard({recruiter}){
+  const [copied,setCopied]=useState(null);
+  if(!recruiter) return null;
+  const cp=(text,label)=>{navigator.clipboard.writeText(text).then(()=>{setCopied(label);setTimeout(()=>setCopied(null),1500);});};
+  const row={display:"flex",alignItems:"center",gap:10,padding:"7px 0",fontSize:12};
+  const ib={width:28,height:28,borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,flexShrink:0};
+  return(
+    <div style={{padding:"16px 24px",borderBottom:"1px solid var(--c-border)"}}>
+      <div style={{fontSize:11,fontWeight:700,color:"var(--c-text-muted)",textTransform:"uppercase",letterSpacing:".04em",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
+        <span style={{fontSize:14}}>👤</span> Recruiter / Contact Person
+      </div>
+      <div style={{background:"var(--c-surface)",borderRadius:12,padding:"14px 16px",border:"1px solid var(--c-border)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10,paddingBottom:10,borderBottom:"1px solid var(--c-border)"}}>
+          <div style={{width:40,height:40,borderRadius:10,background:"linear-gradient(135deg,#0a66c2,#004182)",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:15,flexShrink:0}}>
+            {recruiter.name.split(" ").map(n=>n[0]).join("").substring(0,2)}
+          </div>
+          <div>
+            <div style={{fontWeight:600,fontSize:13}}>{recruiter.name}</div>
+            <div style={{fontSize:11,color:"var(--c-text-muted)"}}>{recruiter.title}</div>
+          </div>
+        </div>
+        {recruiter.email&&<div style={row}><div style={{...ib,background:"var(--c-blue-soft)",color:"var(--c-blue)"}}>✉</div><span style={{flex:1,color:"var(--c-text-secondary)",wordBreak:"break-all"}}>{recruiter.email}</span><button onClick={()=>cp(recruiter.email,"email")} style={{background:"none",border:"none",color:copied==="email"?"var(--c-green)":"var(--c-accent)",cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}}>{copied==="email"?"✓ Copied":"Copy"}</button></div>}
+        {recruiter.phone&&<div style={row}><div style={{...ib,background:"var(--c-green-soft)",color:"var(--c-green)"}}>📞</div><span style={{flex:1,color:"var(--c-text-secondary)"}}>{recruiter.phone}</span><button onClick={()=>cp(recruiter.phone,"phone")} style={{background:"none",border:"none",color:copied==="phone"?"var(--c-green)":"var(--c-accent)",cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}}>{copied==="phone"?"✓ Copied":"Copy"}</button></div>}
+        {recruiter.linkedin&&<div style={row}><div style={{...ib,background:"#0a66c214",color:"#0a66c2"}}>in</div><span style={{flex:1,color:"var(--c-text-secondary)",wordBreak:"break-all"}}>{recruiter.linkedin}</span><a href={`https://${recruiter.linkedin}`} target="_blank" rel="noopener noreferrer" style={{color:"var(--c-accent)",fontSize:11,fontWeight:600,textDecoration:"none"}}>Open →</a></div>}
+        <div style={{display:"flex",gap:8,marginTop:12,paddingTop:10,borderTop:"1px solid var(--c-border)"}}>
+          {recruiter.email&&<a href={`mailto:${recruiter.email}?subject=Regarding the open position`} style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 14px",borderRadius:8,background:"var(--c-accent)",color:"#fff",fontSize:11,fontWeight:600,textDecoration:"none"}}>✉ Email Recruiter</a>}
+          {recruiter.linkedin&&<a href={`https://${recruiter.linkedin}`} target="_blank" rel="noopener noreferrer" style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:6,padding:"8px 14px",borderRadius:8,background:"#0a66c2",color:"#fff",fontSize:11,fontWeight:600,textDecoration:"none"}}>in Message on LinkedIn</a>}
+          {recruiter.phone&&<a href={`tel:${recruiter.phone}`} style={{flex:0,display:"flex",alignItems:"center",justifyContent:"center",padding:"8px 14px",borderRadius:8,background:"var(--c-green)",color:"#fff",fontSize:11,fontWeight:600,textDecoration:"none"}}>📞 Call</a>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ MAIN APP ═══
+function JobSearchDashboard(){
+  const [tab,setTab]=useState("search");
+  const [jobs,setJobs]=useState(SAMPLE_JOBS);
+  const [sel,setSel]=useState(null);
+  const [q,setQ]=useState("");
+  const [loc,setLoc]=useState("");
+  const [jType,setJType]=useState("All");
+  const [posted,setPosted]=useState("any");
+  const [adv,setAdv]=useState(false);
+  const [salMin,setSalMin]=useState("");
+  const [salMax,setSalMax]=useState("");
+  const [coFilter,setCoFilter]=useState("");
+  const [expLvl,setExpLvl]=useState("All");
+  const [sort,setSort]=useState("match");
+  const [sourceFilter,setSourceFilter]=useState("All");
+  const [saved,setSaved]=useState(()=>{try{return JSON.parse(localStorage.getItem("jsd2_saved")||"[]")}catch{return[]}});
+  const [applied,setApplied]=useState(()=>{try{return JSON.parse(localStorage.getItem("jsd2_applied")||"{}")}catch{return{}}});
+  const [notes,setNotes]=useState(()=>{try{return JSON.parse(localStorage.getItem("jsd2_notes")||"{}")}catch{return{}}});
+  const [toasts,setToasts]=useState([]);
+  const [searching,setSearching]=useState(false);
+  const [resume,setResume]=useState(()=>{try{return JSON.parse(localStorage.getItem("jsd2_resume"))||SAMPLE_RESUME}catch{return SAMPLE_RESUME}});
+  const [alerts,setAlerts]=useState(()=>{try{return JSON.parse(localStorage.getItem("jsd2_alerts")||"[]")}catch{return[]}});
+  const [mobDetail,setMobDetail]=useState(false);
+
+  useEffect(()=>{localStorage.setItem("jsd2_saved",JSON.stringify(saved))},[saved]);
+  useEffect(()=>{localStorage.setItem("jsd2_applied",JSON.stringify(applied))},[applied]);
+  useEffect(()=>{localStorage.setItem("jsd2_notes",JSON.stringify(notes))},[notes]);
+  useEffect(()=>{localStorage.setItem("jsd2_resume",JSON.stringify(resume))},[resume]);
+  useEffect(()=>{localStorage.setItem("jsd2_alerts",JSON.stringify(alerts))},[alerts]);
+
+  const toast=useCallback((msg,type="success")=>{const id=generateId();setToasts(p=>[...p,{id,message:msg,type}]);setTimeout(()=>setToasts(p=>p.filter(t=>t.id!==id)),3200)},[]);
+  const toggleSave=(id)=>{const was=saved.includes(id);setSaved(p=>was?p.filter(i=>i!==id):[...p,id]);toast(was?"Removed from saved":"Job saved!")};
+  const applyJob=(id,status="Applied")=>{setApplied(p=>({...p,[id]:{status,date:fmtDate(),source:jobs.find(j=>j.id===id)?.source||"LinkedIn"}}));toast(`Status → ${status}`)};
+
+  const filtered=jobs.filter(j=>{
+    const sq=q.toLowerCase(), sl=loc.toLowerCase();
+    return(!sq||j.title.toLowerCase().includes(sq)||j.company.toLowerCase().includes(sq)||j.skills.some(s=>s.toLowerCase().includes(sq)))
+      &&(!sl||j.location.toLowerCase().includes(sl))
+      &&(jType==="All"||j.type===jType)
+      &&(sourceFilter==="All"||j.source===sourceFilter)
+      &&(!coFilter||j.company.toLowerCase().includes(coFilter.toLowerCase()))
+      &&withinPosted(j.posted,posted);
+  }).sort((a,b)=>sort==="match"?b.match-a.match:sort==="newest"?new Date(b.posted)-new Date(a.posted):0);
+
+  const stats={total:filtered.length,applied:Object.keys(applied).length,saved:saved.length,rate:Object.keys(applied).length>0?Math.round((Object.values(applied).filter(a=>a.status==="Offered"||a.status==="Interview").length/Object.keys(applied).length)*100):0,alerts:alerts.filter(a=>a.active).length};
+  const doSearch=async()=>{if(!q.trim()){toast("Enter a search query","error");return;}setSearching(true);try{const results=await searchAllAPIs(q,loc,posted);setJobs(results.length>0?results:SAMPLE_JOBS);toast(`Found ${results.length} jobs from APIs`,"info")}catch(err){console.error(err);toast("API error — showing sample data","error")}setSearching(false)};
+  const pickJob=(j)=>{setSel(j);setMobDetail(true)};
+
+  const S={
+    input:{width:"100%",padding:"11px 16px",borderRadius:10,border:"1px solid var(--c-border)",background:"var(--c-surface)",fontSize:13,color:"var(--c-text)",fontFamily:"inherit",transition:"border-color .2s, box-shadow .2s"},
+    label:{fontSize:11,fontWeight:600,color:"var(--c-text-muted)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".04em"},
+    card:{background:"var(--c-card)",borderRadius:14,border:"1px solid var(--c-border)",boxShadow:"var(--shadow-sm)",transition:"all .2s"},
+    btn:{padding:"10px 22px",borderRadius:10,border:"none",fontWeight:600,fontSize:13,cursor:"pointer",transition:"all .15s",fontFamily:"inherit"},
+    pri:{background:"var(--c-accent)",color:"#fff"},
+    ghost:{background:"var(--c-card)",border:"1px solid var(--c-border)",color:"var(--c-text-secondary)"},
+  };
+
+  return(
+    <div style={{fontFamily:"'Outfit','DM Sans',system-ui,sans-serif",background:"var(--c-bg)",minHeight:"100vh",color:"var(--c-text)"}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');
+        :root{--c-bg:#f0f2f7;--c-card:#fff;--c-surface:#f5f6fa;--c-border:#e0e4ee;--c-border-focus:#6366f1;--c-text:#111827;--c-text-secondary:#4b5563;--c-text-muted:#9ca3af;--c-accent:#6366f1;--c-accent-soft:#eef2ff;--c-accent-hover:#4f46e5;--c-green:#059669;--c-green-soft:#ecfdf5;--c-orange:#ea580c;--c-orange-soft:#fff7ed;--c-red:#dc2626;--c-red-soft:#fef2f2;--c-blue:#2563eb;--c-blue-soft:#eff6ff;--c-pink:#ec4899;--c-pink-soft:#fdf2f8;--shadow-sm:0 1px 3px rgba(0,0,0,.03),0 1px 2px rgba(0,0,0,.04);--shadow-md:0 4px 20px rgba(0,0,0,.06);--shadow-lg:0 10px 40px rgba(0,0,0,.08)}
+        @media(prefers-color-scheme:dark){:root{--c-bg:#0c0e14;--c-card:#161821;--c-surface:#1e2029;--c-border:#282a36;--c-border-focus:#818cf8;--c-text:#e5e7eb;--c-text-secondary:#9ca3af;--c-text-muted:#6b7280;--c-accent:#818cf8;--c-accent-soft:#1e1b4b;--c-accent-hover:#6366f1;--c-green-soft:#064e3b;--c-orange-soft:#431407;--c-red-soft:#450a0a;--c-blue-soft:#1e3a5f;--c-pink-soft:#4a1942;--shadow-sm:0 1px 3px rgba(0,0,0,.2);--shadow-md:0 4px 20px rgba(0,0,0,.3);--shadow-lg:0 10px 40px rgba(0,0,0,.4)}}
+        *{box-sizing:border-box;margin:0;padding:0}
+        @keyframes toastIn{from{transform:translateX(60px) scale(.9);opacity:0}to{transform:translateX(0) scale(1);opacity:1}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+        .fu{animation:fadeUp .4s cubic-bezier(.21,1.02,.73,1)}
+        input:focus,select:focus,textarea:focus{outline:none;border-color:var(--c-border-focus)!important;box-shadow:0 0 0 3px rgba(99,102,241,.1)!important}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--c-border);border-radius:3px}
+        .sk{background:linear-gradient(90deg,var(--c-surface) 25%,var(--c-border) 50%,var(--c-surface) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:8px}
+        @media(max-width:768px){.hm{display:none!important}}
+        @media(min-width:769px){.hd{display:none!important}}
+      `}</style>
+
+      {/* HEADER */}
+      <header style={{background:"var(--c-card)",borderBottom:"1px solid var(--c-border)",padding:"18px 28px"}}>
+        <div style={{maxWidth:1440,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{width:40,height:40,borderRadius:12,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:20,fontWeight:700,boxShadow:"0 4px 12px rgba(99,102,241,.3)"}}>⚡</div>
+            <div>
+              <h1 style={{fontSize:20,fontWeight:700,letterSpacing:"-.025em"}}>Job Search Dashboard</h1>
+              <p style={{fontSize:12,color:"var(--c-text-muted)",marginTop:1}}>LinkedIn & Google Jobs · Track, apply & connect with recruiters</p>
+            </div>
+          </div>
+          <div style={{fontSize:11,color:"var(--c-text-muted)",display:"flex",alignItems:"center",gap:6}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:"var(--c-green)",display:"inline-block"}}></span>
+            Sample Data — Connect APIs for live results
+          </div>
+        </div>
+      </header>
+
+      {/* NAV */}
+      <nav style={{background:"var(--c-card)",borderBottom:"1px solid var(--c-border)",padding:"0 28px",overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+        <div style={{maxWidth:1440,margin:"0 auto",display:"flex",gap:0}}>
+          {[{k:"search",l:"Search",i:"🔍"},{k:"applications",l:"Applications",i:"📋",b:stats.applied},{k:"saved",l:"Saved",i:"⭐",b:stats.saved},{k:"alerts",l:"Alerts",i:"🔔",b:stats.alerts},{k:"resume",l:"Resume",i:"📄"},{k:"insights",l:"Insights",i:"📊"}].map(t=>(
+            <button key={t.k} onClick={()=>{setTab(t.k);setMobDetail(false)}} style={{padding:"14px 18px",border:"none",background:"none",cursor:"pointer",fontSize:13,fontWeight:tab===t.k?600:400,display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",transition:"all .15s",fontFamily:"inherit",color:tab===t.k?"var(--c-accent)":"var(--c-text-muted)",borderBottom:tab===t.k?"2px solid var(--c-accent)":"2px solid transparent"}}>
+              <span style={{fontSize:14}}>{t.i}</span>{t.l}
+              {t.b>0&&<span style={{background:"var(--c-accent)",color:"#fff",fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:10,minWidth:18,textAlign:"center"}}>{t.b}</span>}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      <main style={{maxWidth:1440,margin:"0 auto",padding:"20px 28px 40px"}}>
+
+        {/* ═══ SEARCH TAB ═══ */}
+        {tab==="search"&&(
+          <div className="fu">
+            {/* Search */}
+            <div style={{...S.card,padding:22,marginBottom:18}}>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                <input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==="Enter"&&doSearch()} placeholder="Job title, skill, or keyword..." style={{...S.input,flex:"2 1 220px"}} />
+                <input value={loc} onChange={e=>setLoc(e.target.value)} placeholder="📍 Location" style={{...S.input,flex:"1 1 140px"}} />
+                <select value={jType} onChange={e=>setJType(e.target.value)} style={{...S.input,flex:"0 1 130px",cursor:"pointer"}}><option value="All">All Types</option><option>Full-time</option><option>Part-time</option><option>Contract</option><option>Remote</option></select>
+                <select value={posted} onChange={e=>setPosted(e.target.value)} style={{...S.input,flex:"0 1 150px",cursor:"pointer"}}>{POSTED_OPTIONS.map(p=><option key={p.key} value={p.key}>{p.label}</option>)}</select>
+                <button onClick={doSearch} style={{...S.btn,...S.pri,padding:"11px 32px",minWidth:110}} onMouseEnter={e=>e.target.style.background="var(--c-accent-hover)"} onMouseLeave={e=>e.target.style.background="var(--c-accent)"}>{searching?"⟳ Searching...":"Search"}</button>
+              </div>
+              <div style={{marginTop:12,display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+                <button onClick={()=>setAdv(!adv)} style={{background:"none",border:"none",color:"var(--c-accent)",fontSize:12,cursor:"pointer",fontWeight:500,fontFamily:"inherit"}}>{adv?"▾ Hide":"▸ Show"} advanced filters</button>
+                <div style={{display:"flex",gap:6,marginLeft:8}}>
+                  {["All","LinkedIn","Google Jobs"].map(s=>(
+                    <button key={s} onClick={()=>setSourceFilter(s)} style={{padding:"4px 12px",borderRadius:7,border:"1px solid var(--c-border)",fontSize:11,fontWeight:sourceFilter===s?600:400,cursor:"pointer",fontFamily:"inherit",background:sourceFilter===s?(s==="LinkedIn"?"#0a66c2":s==="Google Jobs"?"#4285f4":"var(--c-accent)"):"var(--c-card)",color:sourceFilter===s?"#fff":"var(--c-text-muted)",transition:"all .15s"}}>{s}</button>
+                  ))}
+                </div>
+                <div style={{flex:1}}></div>
+                <span style={{fontSize:12,color:"var(--c-text-muted)"}}>Sort</span>
+                <select value={sort} onChange={e=>setSort(e.target.value)} style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--c-border)",background:"var(--c-surface)",fontSize:12,color:"var(--c-text)",fontFamily:"inherit"}}><option value="match">Match Score</option><option value="newest">Newest First</option></select>
+              </div>
+              {adv&&(
+                <div style={{marginTop:16,display:"flex",gap:10,flexWrap:"wrap",paddingTop:16,borderTop:"1px solid var(--c-border)"}}>
+                  <input value={salMin} onChange={e=>setSalMin(e.target.value)} placeholder="Min Salary (₹L)" style={{...S.input,flex:"1 1 120px",padding:"9px 14px",fontSize:12}} />
+                  <input value={salMax} onChange={e=>setSalMax(e.target.value)} placeholder="Max Salary (₹L)" style={{...S.input,flex:"1 1 120px",padding:"9px 14px",fontSize:12}} />
+                  <input value={coFilter} onChange={e=>setCoFilter(e.target.value)} placeholder="Company name" style={{...S.input,flex:"1 1 160px",padding:"9px 14px",fontSize:12}} />
+                  <select value={expLvl} onChange={e=>setExpLvl(e.target.value)} style={{...S.input,flex:"0 1 130px",padding:"9px 14px",fontSize:12}}><option>All Levels</option><option>Entry</option><option>Mid</option><option>Senior</option><option>Lead</option></select>
+                </div>
+              )}
+            </div>
+
+            {/* Stats */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:18}}>
+              {[{l:"Jobs Found",v:stats.total,i:"🔍",c:"var(--c-accent)",bg:"var(--c-accent-soft)"},{l:"Applied",v:stats.applied,i:"📨",c:"var(--c-blue)",bg:"var(--c-blue-soft)"},{l:"Saved",v:stats.saved,i:"⭐",c:"var(--c-orange)",bg:"var(--c-orange-soft)"},{l:"Success Rate",v:`${stats.rate}%`,i:"📈",c:"var(--c-green)",bg:"var(--c-green-soft)"},{l:"Active Alerts",v:stats.alerts,i:"🔔",c:"var(--c-pink)",bg:"var(--c-pink-soft)"}].map((s,i)=>(
+                <div key={i} style={{...S.card,padding:"16px 18px",display:"flex",alignItems:"center",gap:14}}>
+                  <div style={{width:42,height:42,borderRadius:11,background:s.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>{s.i}</div>
+                  <div><div style={{fontSize:20,fontWeight:700,color:s.c,letterSpacing:"-.02em"}}>{s.v}</div><div style={{fontSize:11,color:"var(--c-text-muted)",fontWeight:500}}>{s.l}</div></div>
+                </div>
+              ))}
+            </div>
+
+            {/* Two columns */}
+            <div style={{display:"flex",gap:18,alignItems:"flex-start"}}>
+              {/* Listings */}
+              <div style={{flex:"1 1 450px",display:"flex",flexDirection:"column",gap:10}} className={mobDetail?"hm":""}>
+                {searching?[1,2,3].map(i=><div key={i} style={{...S.card,padding:24}}><div className="sk" style={{height:16,width:"55%",marginBottom:10}}></div><div className="sk" style={{height:13,width:"35%",marginBottom:8}}></div><div className="sk" style={{height:12,width:"75%"}}></div></div>)
+                :filtered.length===0?<div style={{...S.card,padding:56,textAlign:"center"}}><div style={{fontSize:48,marginBottom:14}}>🔍</div><div style={{fontWeight:600,fontSize:15}}>No jobs match</div><div style={{fontSize:13,color:"var(--c-text-muted)",marginTop:4}}>Try broadening your search or adjusting filters</div></div>
+                :filtered.map(job=>{
+                  const isSel=sel?.id===job.id;
+                  const srcColor=job.source==="LinkedIn"?"#0a66c2":"#4285f4";
+                  return(
+                    <div key={job.id} onClick={()=>pickJob(job)} style={{...S.card,padding:18,cursor:"pointer",borderColor:isSel?"var(--c-accent)":undefined,boxShadow:isSel?"0 0 0 3px rgba(99,102,241,.1),var(--shadow-md)":"var(--shadow-sm)"}}>
+                      <div style={{display:"flex",gap:14,alignItems:"flex-start"}}>
+                        <div style={{width:44,height:44,borderRadius:12,background:`${job.color}14`,color:job.color,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:13,flexShrink:0,border:`1px solid ${job.color}22`}}>{job.logo}</div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                            <h3 style={{fontSize:14,fontWeight:600,lineHeight:1.35}}>{job.title}</h3>
+                            <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:6,whiteSpace:"nowrap",flexShrink:0,background:job.match>=80?"var(--c-green-soft)":job.match>=60?"var(--c-orange-soft)":"var(--c-surface)",color:job.match>=80?"var(--c-green)":job.match>=60?"var(--c-orange)":"var(--c-text-muted)"}}>{job.match}%</span>
+                          </div>
+                          <div style={{fontSize:12,color:"var(--c-text-secondary)",marginBottom:6}}>{job.company} · {job.location}</div>
+                          <p style={{fontSize:12,color:"var(--c-text-muted)",lineHeight:1.55,marginBottom:10,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{job.description}</p>
+                          <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                            <span style={{fontSize:10,fontWeight:600,padding:"3px 10px",borderRadius:6,background:job.type==="Remote"?"var(--c-green-soft)":job.type==="Contract"?"var(--c-orange-soft)":"var(--c-blue-soft)",color:job.type==="Remote"?"var(--c-green)":job.type==="Contract"?"var(--c-orange)":"var(--c-blue)"}}>{job.type}</span>
+                            {job.salary&&<span style={{fontSize:11,color:"var(--c-text-secondary)",fontWeight:500}}>{job.salary}</span>}
+                            <span style={{marginLeft:"auto",fontSize:10,color:"var(--c-text-muted)"}}>{postedLabel(job.posted)}</span>
+                            <span style={{fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:4,letterSpacing:".03em",background:`${srcColor}12`,color:srcColor}}>{job.source}</span>
+                          </div>
+                          {/* Recruiter quick peek */}
+                          {job.recruiter&&<div style={{marginTop:8,padding:"6px 10px",borderRadius:8,background:"var(--c-surface)",border:"1px solid var(--c-border)",display:"flex",alignItems:"center",gap:8,fontSize:11,color:"var(--c-text-secondary)"}}>
+                            <span style={{fontWeight:600}}>👤 {job.recruiter.name}</span>
+                            <span style={{color:"var(--c-text-muted)"}}>·</span>
+                            <span style={{color:"var(--c-text-muted)"}}>{job.recruiter.title}</span>
+                          </div>}
+                          <div style={{display:"flex",gap:8,marginTop:10}}>
+                            <button onClick={e=>{e.stopPropagation();toggleSave(job.id)}} style={{...S.btn,...S.ghost,padding:"5px 14px",fontSize:11,...(saved.includes(job.id)?{background:"var(--c-orange-soft)",color:"var(--c-orange)",borderColor:"var(--c-orange)"}:{})}}>{saved.includes(job.id)?"★ Saved":"☆ Save"}</button>
+                            <button onClick={e=>{e.stopPropagation();applyJob(job.id)}} style={{...S.btn,padding:"5px 14px",fontSize:11,...(applied[job.id]?{background:"var(--c-green-soft)",color:"var(--c-green)",border:"1px solid var(--c-green)"}:{...S.pri})}}>{applied[job.id]?`✓ ${applied[job.id].status}`:"Apply"}</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Detail Panel */}
+              <div style={{flex:"1 1 450px",position:"sticky",top:20}} className={!mobDetail&&!sel?"hm":""}>
+                {sel?(
+                  <div className="fu" style={{...S.card,overflow:"hidden",boxShadow:"var(--shadow-md)"}}>
+                    <div style={{padding:"22px 24px 18px",borderBottom:"1px solid var(--c-border)"}}>
+                      <button className="hd" onClick={()=>{setMobDetail(false);setSel(null)}} style={{background:"none",border:"none",color:"var(--c-accent)",fontSize:12,fontWeight:600,cursor:"pointer",marginBottom:12,padding:0,fontFamily:"inherit"}}>← Back to list</button>
+                      <div style={{display:"flex",gap:16,alignItems:"flex-start"}}>
+                        <div style={{width:52,height:52,borderRadius:14,background:`${sel.color}14`,color:sel.color,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:17,flexShrink:0,border:`1px solid ${sel.color}22`}}>{sel.logo}</div>
+                        <div>
+                          <h2 style={{fontSize:18,fontWeight:700,letterSpacing:"-.01em",lineHeight:1.3}}>{sel.title}</h2>
+                          <div style={{fontSize:13,color:"var(--c-text-secondary)",marginTop:2}}>{sel.company}</div>
+                          <div style={{display:"flex",gap:14,marginTop:8,fontSize:12,color:"var(--c-text-muted)",flexWrap:"wrap"}}>
+                            <span>📍 {sel.location}</span><span>💼 {sel.type}</span>{sel.salary&&<span>💰 {sel.salary}</span>}<span>📅 {postedLabel(sel.posted)}</span>
+                            <span style={{fontSize:10,fontWeight:700,padding:"1px 8px",borderRadius:4,background:sel.source==="LinkedIn"?"#0a66c214":"#4285f414",color:sel.source==="LinkedIn"?"#0a66c2":"#4285f4"}}>{sel.source}</span>
+                          </div>
+                        </div>
+                      </div>
+                      {/* Match */}
+                      <div style={{marginTop:18,padding:14,borderRadius:12,background:sel.match>=80?"var(--c-green-soft)":sel.match>=60?"var(--c-orange-soft)":"var(--c-surface)"}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                          <span style={{fontWeight:600,fontSize:12}}>Resume Match</span>
+                          <span style={{fontWeight:800,fontSize:20,color:sel.match>=80?"var(--c-green)":sel.match>=60?"var(--c-orange)":"var(--c-text-muted)"}}>{sel.match}%</span>
+                        </div>
+                        <div style={{height:5,borderRadius:3,background:"var(--c-border)",overflow:"hidden"}}><div style={{height:"100%",width:`${sel.match}%`,borderRadius:3,transition:"width .6s cubic-bezier(.21,1.02,.73,1)",background:sel.match>=80?"var(--c-green)":sel.match>=60?"var(--c-orange)":"var(--c-text-muted)"}}></div></div>
+                      </div>
+                    </div>
+
+                    {/* Status */}
+                    <div style={{padding:"14px 24px",borderBottom:"1px solid var(--c-border)",display:"flex",gap:6,flexWrap:"wrap"}}>
+                      {["Applied","Interview","Offered","Rejected"].map(st=>{
+                        const a=applied[sel.id]?.status===st;
+                        const c={Applied:"var(--c-blue)",Interview:"var(--c-orange)",Offered:"var(--c-green)",Rejected:"var(--c-red)"}[st];
+                        return(<button key={st} onClick={()=>applyJob(sel.id,st)} style={{...S.btn,padding:"7px 16px",fontSize:11,borderRadius:8,background:a?c:"var(--c-card)",color:a?"#fff":"var(--c-text-secondary)",border:a?"none":"1px solid var(--c-border)"}}>{st}</button>);
+                      })}
+                      <button onClick={()=>toggleSave(sel.id)} style={{...S.btn,padding:"7px 16px",fontSize:11,borderRadius:8,marginLeft:"auto",...(saved.includes(sel.id)?{background:"var(--c-orange-soft)",color:"var(--c-orange)",border:"1px solid var(--c-orange)"}:{...S.ghost})}}>{saved.includes(sel.id)?"★ Saved":"☆ Save"}</button>
+                    </div>
+
+                    {/* Recruiter Contact */}
+                    <RecruiterCard recruiter={sel.recruiter}/>
+
+                    {/* Skills */}
+                    <div style={{padding:"16px 24px",borderBottom:"1px solid var(--c-border)"}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"var(--c-text-muted)",textTransform:"uppercase",letterSpacing:".04em",marginBottom:8}}>Required Skills</div>
+                      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{sel.skills.map(sk=>{const m=resume.skills.some(rs=>rs.toLowerCase().includes(sk.toLowerCase())||sk.toLowerCase().includes(rs.toLowerCase()));return(<span key={sk} style={{padding:"5px 12px",borderRadius:7,fontSize:11,fontWeight:500,background:m?"var(--c-green-soft)":"var(--c-surface)",color:m?"var(--c-green)":"var(--c-text-secondary)",border:m?"1px solid var(--c-green)":"1px solid transparent"}}>{m?"✓ ":""}{sk}</span>)})}</div>
+                    </div>
+
+                    {/* Description */}
+                    <div style={{padding:"18px 24px",borderBottom:"1px solid var(--c-border)",maxHeight:280,overflowY:"auto"}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"var(--c-text-muted)",textTransform:"uppercase",letterSpacing:".04em",marginBottom:8}}>Job Description</div>
+                      <pre style={{fontSize:12,color:"var(--c-text)",lineHeight:1.7,whiteSpace:"pre-wrap",fontFamily:"inherit"}}>{sel.fullDesc}</pre>
+                    </div>
+
+                    {/* Notes */}
+                    <div style={{padding:"16px 24px"}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"var(--c-text-muted)",textTransform:"uppercase",letterSpacing:".04em",marginBottom:6}}>Personal Notes</div>
+                      <textarea value={notes[sel.id]||""} onChange={e=>setNotes(p=>({...p,[sel.id]:e.target.value}))} placeholder="Add notes about this job..." style={{...S.input,resize:"vertical",minHeight:60,lineHeight:1.5}} />
+                      <button style={{...S.btn,...S.pri,width:"100%",marginTop:12,padding:"12px 20px"}}>Apply on {sel.source} →</button>
+                      <div style={{fontSize:10,color:"var(--c-text-muted)",marginTop:8,textAlign:"center"}}>
+                        Source: {sel.source} · Posted {postedLabel(sel.posted)}{applied[sel.id]&&` · Applied ${applied[sel.id].date}`}
+                      </div>
+                    </div>
+                  </div>
+                ):(
+                  <div className="hm" style={{...S.card,padding:56,textAlign:"center"}}><div style={{fontSize:48,marginBottom:14,opacity:.6}}>👈</div><div style={{fontWeight:600,fontSize:15}}>Select a job</div><div style={{fontSize:13,color:"var(--c-text-muted)",marginTop:4}}>Click any listing to see full details & recruiter contact</div></div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ APPLICATIONS TAB ═══ */}
+        {tab==="applications"&&(
+          <div className="fu">
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:12}}>
+              <h2 style={{fontSize:20,fontWeight:700}}>My Applications</h2>
+              <button onClick={()=>{const rows=Object.entries(applied).map(([id,a])=>{const j=jobs.find(j=>j.id===Number(id));return j?`"${j.title}","${j.company}","${a.status}","${a.date}","${a.source}"`:"";}).filter(Boolean);const csv="Title,Company,Status,Date,Source\n"+rows.join("\n");Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv"})),download:"applications.csv"}).click();toast("Exported to CSV")}} style={{...S.btn,...S.ghost,fontSize:12,padding:"8px 16px"}}>📥 Export CSV</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12,marginBottom:20}}>
+              {[{s:"Applied",c:"var(--c-blue)",bg:"var(--c-blue-soft)"},{s:"Interview",c:"var(--c-orange)",bg:"var(--c-orange-soft)"},{s:"Offered",c:"var(--c-green)",bg:"var(--c-green-soft)"},{s:"Rejected",c:"var(--c-red)",bg:"var(--c-red-soft)"}].map(({s,c,bg})=>(
+                <div key={s} style={{background:bg,borderRadius:12,padding:"16px 18px",textAlign:"center"}}><div style={{fontSize:26,fontWeight:800,color:c}}>{Object.values(applied).filter(a=>a.status===s).length}</div><div style={{fontSize:11,fontWeight:600,color:c,marginTop:2}}>{s}</div></div>
+              ))}
+            </div>
+            {Object.keys(applied).length===0?<div style={{...S.card,padding:56,textAlign:"center"}}><div style={{fontSize:48,marginBottom:14}}>📋</div><div style={{fontWeight:600,fontSize:15}}>No applications yet</div><div style={{fontSize:13,color:"var(--c-text-muted)",marginTop:4}}>Apply to jobs from the Search tab</div></div>
+            :<div style={{display:"flex",flexDirection:"column",gap:8}}>{Object.entries(applied).map(([id,app])=>{const job=jobs.find(j=>j.id===Number(id));if(!job)return null;const sc={Applied:"var(--c-blue)",Interview:"var(--c-orange)",Offered:"var(--c-green)",Rejected:"var(--c-red)"}[app.status];return(
+              <div key={id} style={{...S.card,padding:"16px 20px",borderLeft:`4px solid ${sc}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
+                <div style={{display:"flex",gap:14,alignItems:"center"}}>
+                  <div style={{width:38,height:38,borderRadius:10,background:`${job.color}14`,color:job.color,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:12,flexShrink:0}}>{job.logo}</div>
+                  <div><div style={{fontWeight:600,fontSize:13}}>{job.title}</div><div style={{fontSize:12,color:"var(--c-text-secondary)"}}>{job.company} · {job.location}</div>
+                    {job.recruiter&&<div style={{fontSize:11,color:"var(--c-text-muted)",marginTop:2}}>👤 {job.recruiter.name} · {job.recruiter.email}</div>}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:11,color:"var(--c-text-muted)"}}>{app.date}</span>
+                  <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:app.source==="LinkedIn"?"#0a66c214":"#4285f414",color:app.source==="LinkedIn"?"#0a66c2":"#4285f4",fontWeight:700}}>{app.source}</span>
+                  <select value={app.status} onChange={e=>applyJob(Number(id),e.target.value)} style={{padding:"5px 10px",borderRadius:6,border:"1px solid var(--c-border)",background:"var(--c-surface)",fontSize:11,color:"var(--c-text)",fontFamily:"inherit",fontWeight:500}}><option>Applied</option><option>Interview</option><option>Offered</option><option>Rejected</option></select>
+                </div>
+              </div>
+            )})}</div>}
+          </div>
+        )}
+
+        {/* ═══ SAVED TAB ═══ */}
+        {tab==="saved"&&(
+          <div className="fu">
+            <h2 style={{fontSize:20,fontWeight:700,marginBottom:20}}>Saved Jobs <span style={{fontWeight:400,color:"var(--c-text-muted)"}}>({saved.length})</span></h2>
+            {saved.length===0?<div style={{...S.card,padding:56,textAlign:"center"}}><div style={{fontSize:48,marginBottom:14}}>⭐</div><div style={{fontWeight:600,fontSize:15}}>No saved jobs</div></div>
+            :<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:12}}>
+              {saved.map(id=>{const job=jobs.find(j=>j.id===id);if(!job)return null;return(
+                <div key={id} style={{...S.card,padding:18}}>
+                  <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                    <div style={{width:40,height:40,borderRadius:10,background:`${job.color}14`,color:job.color,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:12,flexShrink:0}}>{job.logo}</div>
+                    <div style={{flex:1}}>
+                      <h3 style={{fontSize:14,fontWeight:600,marginBottom:2}}>{job.title}</h3>
+                      <div style={{fontSize:12,color:"var(--c-text-secondary)",marginBottom:4}}>{job.company} · {job.location}</div>
+                      {job.recruiter&&<div style={{fontSize:11,color:"var(--c-text-muted)",marginBottom:6}}>👤 {job.recruiter.name} — <a href={`mailto:${job.recruiter.email}`} style={{color:"var(--c-accent)",textDecoration:"none"}}>{job.recruiter.email}</a></div>}
+                      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10}}>
+                        <span style={{fontSize:10,fontWeight:600,padding:"3px 10px",borderRadius:6,background:"var(--c-blue-soft)",color:"var(--c-blue)"}}>{job.type}</span>
+                        <span style={{fontSize:11,color:"var(--c-text-muted)"}}>{job.salary}</span>
+                      </div>
+                      <div style={{display:"flex",gap:8}}>
+                        <button onClick={()=>{setSel(job);setTab("search");setMobDetail(true)}} style={{...S.btn,...S.ghost,padding:"5px 14px",fontSize:11}}>View</button>
+                        <button onClick={()=>toggleSave(id)} style={{...S.btn,padding:"5px 14px",fontSize:11,background:"var(--c-red-soft)",color:"var(--c-red)",border:"none"}}>Remove</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )})}
+            </div>}
+          </div>
+        )}
+
+        {/* ═══ ALERTS TAB ═══ */}
+        {tab==="alerts"&&<AlertsPanel alerts={alerts} setAlerts={setAlerts} toast={toast} S={S}/>}
+
+        {/* ═══ RESUME TAB ═══ */}
+        {tab==="resume"&&<ResumeBuilder resume={resume} setResume={setResume} toast={toast} S={S}/>}
+
+        {/* ═══ INSIGHTS TAB ═══ */}
+        {tab==="insights"&&<Insights applied={applied} jobs={jobs} saved={saved} S={S}/>}
+      </main>
+      <Toasts toasts={toasts} dismiss={id=>setToasts(p=>p.filter(t=>t.id!==id))}/>
+    </div>
+  );
+}
+
+// ═══ ALERTS PANEL (no email integration — simplified) ═══
+function AlertsPanel({alerts,setAlerts,toast,S}){
+  const [show,setShow]=useState(false);
+  const [f,setF]=useState({title:"",location:"",type:"All",salaryMin:"",salaryMax:"",frequency:"Daily",active:true});
+  const add=()=>{if(!f.title){toast("Enter keywords","error");return;}setAlerts(p=>[...p,{...f,id:generateId(),created:fmtDate(),matchCount:Math.floor(Math.random()*25)+3}]);setF({title:"",location:"",type:"All",salaryMin:"",salaryMax:"",frequency:"Daily",active:true});setShow(false);toast("Alert created!")};
+  return(
+    <div className="fu">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:12}}>
+        <h2 style={{fontSize:20,fontWeight:700}}>Job Alerts</h2>
+        <button onClick={()=>setShow(!show)} style={{...S.btn,...S.pri,fontSize:12}}>{show?"Cancel":"+ New Alert"}</button>
+      </div>
+      {show&&(
+        <div style={{...S.card,padding:24,marginBottom:18}}>
+          <h3 style={{fontSize:15,fontWeight:600,marginBottom:16}}>Create Alert</h3>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:12}}>
+            <div><label style={S.label}>Keywords *</label><input value={f.title} onChange={e=>setF({...f,title:e.target.value})} placeholder="e.g. Sales Manager FMCG" style={S.input}/></div>
+            <div><label style={S.label}>Location</label><input value={f.location} onChange={e=>setF({...f,location:e.target.value})} placeholder="City or Remote" style={S.input}/></div>
+            <div><label style={S.label}>Job Type</label><select value={f.type} onChange={e=>setF({...f,type:e.target.value})} style={{...S.input,cursor:"pointer"}}><option>All</option><option>Full-time</option><option>Part-time</option><option>Contract</option><option>Remote</option></select></div>
+            <div><label style={S.label}>Frequency</label><select value={f.frequency} onChange={e=>setF({...f,frequency:e.target.value})} style={{...S.input,cursor:"pointer"}}><option>Real-time</option><option>Daily</option><option>Weekly</option></select></div>
+            <div><label style={S.label}>Source</label><select style={{...S.input,cursor:"pointer"}}><option>LinkedIn + Google Jobs</option><option>LinkedIn only</option><option>Google Jobs only</option></select></div>
+            <div><label style={S.label}>Posted within</label><select style={{...S.input,cursor:"pointer"}}>{POSTED_OPTIONS.map(p=><option key={p.key}>{p.label}</option>)}</select></div>
+          </div>
+          <button onClick={add} style={{...S.btn,...S.pri,marginTop:16,fontSize:12}}>Create Alert</button>
+        </div>
+      )}
+      {alerts.length===0?<div style={{...S.card,padding:56,textAlign:"center"}}><div style={{fontSize:48,marginBottom:14}}>🔔</div><div style={{fontWeight:600,fontSize:15}}>No alerts yet</div><div style={{fontSize:13,color:"var(--c-text-muted)",marginTop:4}}>Create alerts to get notified about matching jobs</div></div>
+      :<div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {alerts.map(a=>(
+          <div key={a.id} style={{...S.card,padding:"16px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12,opacity:a.active?1:.45}}>
+            <div>
+              <div style={{fontWeight:600,fontSize:13}}>🔍 "{a.title}"</div>
+              <div style={{fontSize:12,color:"var(--c-text-secondary)",marginTop:3}}>{a.location&&`📍 ${a.location} · `}{a.type!=="All"?`${a.type} · `:""}{a.frequency} · Created {a.created}</div>
+              {a.matchCount&&<div style={{fontSize:11,color:"var(--c-accent)",marginTop:4,fontWeight:600}}>{a.matchCount} matching jobs</div>}
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={()=>setAlerts(p=>p.map(al=>al.id===a.id?{...al,active:!al.active}:al))} style={{...S.btn,...S.ghost,padding:"5px 14px",fontSize:11}}>{a.active?"Pause":"Resume"}</button>
+              <button onClick={()=>{setAlerts(p=>p.filter(al=>al.id!==a.id));toast("Alert deleted")}} style={{...S.btn,padding:"5px 14px",fontSize:11,background:"var(--c-red-soft)",color:"var(--c-red)",border:"none"}}>Delete</button>
+            </div>
+          </div>
+        ))}
+      </div>}
+    </div>
+  );
+}
+
+// ═══ RESUME BUILDER ═══
+function ResumeBuilder({resume,setResume,toast,S}){
+  const [sec,setSec]=useState("personal");
+  const [preview,setPreview]=useState(false);
+  const [newSkill,setNewSkill]=useState("");
+  const [showNewExp,setShowNewExp]=useState(false);
+  const [nExp,setNExp]=useState({company:"",role:"",dates:"",description:""});
+  const upd=(k,v)=>setResume(p=>({...p,personal:{...p.personal,[k]:v}}));
+
+  const exportText=()=>{const r=resume;let t=`${r.personal.name}\n${r.personal.email} | ${r.personal.phone} | ${r.personal.location}\n`;if(r.personal.linkedin)t+=`${r.personal.linkedin}\n`;if(r.personal.summary)t+=`\nSUMMARY\n${r.personal.summary}\n`;if(r.experience.length){t+=`\nEXPERIENCE\n`;r.experience.forEach(e=>{t+=`\n${e.role} — ${e.company} (${e.dates})\n${e.description}\n`})}if(r.education.length){t+=`\nEDUCATION\n`;r.education.forEach(e=>{t+=`${e.degree} in ${e.field} — ${e.school} (${e.year})\n`})}if(r.skills.length)t+=`\nSKILLS\n${r.skills.join(" · ")}\n`;if(r.certifications?.length)t+=`\nCERTIFICATIONS\n${r.certifications.join("\n")}\n`;if(r.languages?.length)t+=`\nLANGUAGES\n${r.languages.join(" · ")}\n`;Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([t],{type:"text/plain"})),download:`${(r.personal.name||"resume").replace(/\s+/g,"_")}.txt`}).click();toast("Exported as .txt")};
+
+  const secs=[{k:"personal",l:"Personal",i:"👤"},{k:"summary",l:"Summary",i:"📝"},{k:"experience",l:"Experience",i:"💼"},{k:"education",l:"Education",i:"🎓"},{k:"skills",l:"Skills",i:"⚡"},{k:"certifications",l:"Certifications",i:"🏆"},{k:"languages",l:"Languages",i:"🌐"}];
+  return(
+    <div className="fu">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:12}}>
+        <h2 style={{fontSize:20,fontWeight:700}}>Resume Builder</h2>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setPreview(!preview)} style={{...S.btn,...S.ghost,fontSize:12,padding:"8px 16px"}}>{preview?"✏️ Edit":"👁️ Preview"}</button>
+          <button onClick={exportText} style={{...S.btn,...S.pri,fontSize:12,padding:"8px 16px"}}>📥 Export .txt</button>
+        </div>
+      </div>
+      {preview?(
+        <div style={{background:"#fff",color:"#111827",borderRadius:14,padding:"44px 48px",border:"1px solid var(--c-border)",boxShadow:"var(--shadow-lg)",maxWidth:780,margin:"0 auto"}}>
+          <div style={{textAlign:"center",marginBottom:28,paddingBottom:22,borderBottom:"2.5px solid #111827"}}>
+            <h1 style={{fontSize:28,fontWeight:800,letterSpacing:"-.03em",color:"#111827"}}>{resume.personal.name||"Your Name"}</h1>
+            <div style={{fontSize:12,color:"#6b7280",marginTop:7}}>{[resume.personal.email,resume.personal.phone,resume.personal.location,resume.personal.linkedin].filter(Boolean).join("  ·  ")}</div>
+          </div>
+          {resume.personal.summary&&<RSec t="Professional Summary"><p style={{fontSize:12,lineHeight:1.75,color:"#374151"}}>{resume.personal.summary}</p></RSec>}
+          {resume.experience.length>0&&<RSec t="Experience">{resume.experience.map(e=><div key={e.id} style={{marginBottom:16}}><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontWeight:600,fontSize:13,color:"#111827"}}>{e.role}</span><span style={{fontSize:11,color:"#9ca3af"}}>{e.dates}</span></div><div style={{fontSize:12,color:"#6366f1",fontWeight:500,marginBottom:4}}>{e.company}</div><p style={{fontSize:11,lineHeight:1.6,color:"#4b5563"}}>{e.description}</p></div>)}</RSec>}
+          {resume.education.length>0&&<RSec t="Education">{resume.education.map(e=><div key={e.id} style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><div><span style={{fontWeight:600,fontSize:12}}>{e.degree} in {e.field}</span> <span style={{fontSize:12,color:"#6b7280"}}>— {e.school}</span></div><span style={{fontSize:11,color:"#9ca3af"}}>{e.year}</span></div>)}</RSec>}
+          {resume.skills.length>0&&<RSec t="Skills"><div style={{display:"flex",flexWrap:"wrap",gap:6}}>{resume.skills.map(s=><span key={s} style={{padding:"4px 12px",borderRadius:6,background:"#f3f4f6",fontSize:11,fontWeight:500,color:"#374151"}}>{s}</span>)}</div></RSec>}
+          {resume.certifications?.length>0&&<RSec t="Certifications">{resume.certifications.map((c,i)=><div key={i} style={{fontSize:12,color:"#374151",marginBottom:3}}>• {c}</div>)}</RSec>}
+          {resume.languages?.length>0&&<RSec t="Languages"><div style={{fontSize:12,color:"#374151"}}>{resume.languages.join("  ·  ")}</div></RSec>}
+        </div>
+      ):(
+        <div style={{display:"flex",gap:18,flexWrap:"wrap"}}>
+          <div style={{flex:"0 0 170px"}}>{secs.map(s=><button key={s.k} onClick={()=>setSec(s.k)} style={{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"10px 14px",borderRadius:10,border:"none",background:sec===s.k?"var(--c-accent-soft)":"transparent",color:sec===s.k?"var(--c-accent)":"var(--c-text-secondary)",fontSize:12,fontWeight:sec===s.k?600:400,cursor:"pointer",textAlign:"left",marginBottom:3,fontFamily:"inherit"}}><span>{s.i}</span>{s.l}</button>)}</div>
+          <div style={{flex:"1 1 400px",...S.card,padding:24}}>
+            {sec==="personal"&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(210px,1fr))",gap:14}}>{[{k:"name",l:"Full Name"},{k:"email",l:"Email"},{k:"phone",l:"Phone"},{k:"location",l:"Location"},{k:"linkedin",l:"LinkedIn"}].map(f=><div key={f.k}><label style={S.label}>{f.l}</label><input value={resume.personal[f.k]||""} onChange={e=>upd(f.k,e.target.value)} style={S.input}/></div>)}</div>}
+            {sec==="summary"&&<div><label style={S.label}>Professional Summary</label><textarea value={resume.personal.summary||""} onChange={e=>upd("summary",e.target.value)} rows={5} style={{...S.input,resize:"vertical",lineHeight:1.6}}/></div>}
+            {sec==="experience"&&<div>
+              {resume.experience.map(exp=><div key={exp.id} style={{padding:16,borderRadius:12,border:"1px solid var(--c-border)",marginBottom:10,background:"var(--c-surface)"}}><div style={{display:"flex",justifyContent:"space-between"}}><div><div style={{fontWeight:600,fontSize:13}}>{exp.role}</div><div style={{fontSize:12,color:"var(--c-text-secondary)"}}>{exp.company} · {exp.dates}</div></div><button onClick={()=>setResume(p=>({...p,experience:p.experience.filter(e=>e.id!==exp.id)}))} style={{background:"none",border:"none",color:"var(--c-red)",cursor:"pointer",fontSize:16}}>×</button></div><p style={{fontSize:11,color:"var(--c-text-muted)",marginTop:6,lineHeight:1.5}}>{exp.description}</p></div>)}
+              {showNewExp?<div style={{padding:16,borderRadius:12,border:"1px dashed var(--c-accent)"}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                  <div><label style={S.label}>Company</label><input value={nExp.company} onChange={e=>setNExp({...nExp,company:e.target.value})} style={S.input}/></div>
+                  <div><label style={S.label}>Role</label><input value={nExp.role} onChange={e=>setNExp({...nExp,role:e.target.value})} style={S.input}/></div>
+                  <div style={{gridColumn:"span 2"}}><label style={S.label}>Dates</label><input value={nExp.dates} onChange={e=>setNExp({...nExp,dates:e.target.value})} placeholder="e.g. 2022 – Present" style={S.input}/></div>
+                  <div style={{gridColumn:"span 2"}}><label style={S.label}>Description</label><textarea value={nExp.description} onChange={e=>setNExp({...nExp,description:e.target.value})} rows={3} style={{...S.input,resize:"vertical"}}/></div>
+                </div>
+                <div style={{display:"flex",gap:8,marginTop:12}}>
+                  <button onClick={()=>{if(!nExp.company||!nExp.role){toast("Enter company and role","error");return}setResume(p=>({...p,experience:[...p.experience,{...nExp,id:generateId()}]}));setNExp({company:"",role:"",dates:"",description:""});setShowNewExp(false);toast("Added!")}} style={{...S.btn,...S.pri,fontSize:11,padding:"7px 16px"}}>Add</button>
+                  <button onClick={()=>setShowNewExp(false)} style={{...S.btn,...S.ghost,fontSize:11,padding:"7px 16px"}}>Cancel</button>
+                </div>
+              </div>:<button onClick={()=>setShowNewExp(true)} style={{...S.btn,width:"100%",border:"1px dashed var(--c-border)",background:"none",color:"var(--c-accent)",fontSize:12}}>+ Add Experience</button>}
+            </div>}
+            {sec==="education"&&<div>
+              {resume.education.map(edu=><div key={edu.id} style={{padding:14,borderRadius:12,border:"1px solid var(--c-border)",marginBottom:8,background:"var(--c-surface)",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontWeight:600,fontSize:13}}>{edu.degree} in {edu.field}</div><div style={{fontSize:12,color:"var(--c-text-secondary)"}}>{edu.school} · {edu.year}</div></div><button onClick={()=>setResume(p=>({...p,education:p.education.filter(e=>e.id!==edu.id)}))} style={{background:"none",border:"none",color:"var(--c-red)",cursor:"pointer",fontSize:16}}>×</button></div>)}
+              <div style={{padding:16,borderRadius:12,border:"1px dashed var(--c-border)",marginTop:8}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                  <div><label style={S.label}>School</label><input id="es" style={S.input}/></div>
+                  <div><label style={S.label}>Degree</label><input id="ed" style={S.input}/></div>
+                  <div><label style={S.label}>Field</label><input id="ef" style={S.input}/></div>
+                  <div><label style={S.label}>Year</label><input id="ey" style={S.input}/></div>
+                </div>
+                <button onClick={()=>{const s=document.getElementById("es"),d=document.getElementById("ed"),f=document.getElementById("ef"),y=document.getElementById("ey");if(!s.value||!d.value){toast("Enter school and degree","error");return}setResume(p=>({...p,education:[...p.education,{id:generateId(),school:s.value,degree:d.value,field:f.value,year:y.value}]}));s.value="";d.value="";f.value="";y.value="";toast("Added!")}} style={{...S.btn,...S.pri,fontSize:11,padding:"7px 16px",marginTop:12}}>Add Education</button>
+              </div>
+            </div>}
+            {sec==="skills"&&<div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>{resume.skills.map(s=><span key={s} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 14px",borderRadius:8,background:"var(--c-accent-soft)",color:"var(--c-accent)",fontSize:12,fontWeight:500}}>{s}<button onClick={()=>setResume(p=>({...p,skills:p.skills.filter(x=>x!==s)}))} style={{background:"none",border:"none",color:"var(--c-accent)",cursor:"pointer",fontSize:14,lineHeight:1}}>×</button></span>)}</div>
+              <div style={{display:"flex",gap:8}}><input value={newSkill} onChange={e=>setNewSkill(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&newSkill){setResume(p=>({...p,skills:[...p.skills,newSkill]}));setNewSkill("")}}} placeholder="Type a skill..." style={{...S.input,flex:1}}/><button onClick={()=>{if(newSkill){setResume(p=>({...p,skills:[...p.skills,newSkill]}));setNewSkill("")}}} style={{...S.btn,...S.pri,fontSize:12}}>Add</button></div>
+            </div>}
+            {sec==="certifications"&&<div>
+              {(resume.certifications||[]).map((c,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderRadius:10,border:"1px solid var(--c-border)",marginBottom:6,background:"var(--c-surface)"}}><span style={{fontSize:12}}>{c}</span><button onClick={()=>setResume(p=>({...p,certifications:p.certifications.filter((_,j)=>j!==i)}))} style={{background:"none",border:"none",color:"var(--c-red)",cursor:"pointer"}}>×</button></div>)}
+              <input placeholder="Type certification and press Enter" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value){setResume(p=>({...p,certifications:[...(p.certifications||[]),e.target.value]}));e.target.value=""}}} style={S.input}/>
+            </div>}
+            {sec==="languages"&&<div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>{(resume.languages||[]).map((l,i)=><span key={i} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 14px",borderRadius:8,background:"var(--c-green-soft)",color:"var(--c-green)",fontSize:12,fontWeight:500}}>{l}<button onClick={()=>setResume(p=>({...p,languages:p.languages.filter((_,j)=>j!==i)}))} style={{background:"none",border:"none",color:"var(--c-green)",cursor:"pointer",fontSize:14}}>×</button></span>)}</div>
+              <input placeholder="Type language and press Enter" onKeyDown={e=>{if(e.key==="Enter"&&e.target.value){setResume(p=>({...p,languages:[...(p.languages||[]),e.target.value]}));e.target.value=""}}} style={S.input}/>
+            </div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+function RSec({t,children}){return(<div style={{marginBottom:22}}><h3 style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".06em",color:"#6366f1",marginBottom:10}}>{t}</h3>{children}</div>)}
+
+// ═══ INSIGHTS ═══
+function Insights({applied,jobs,saved,S}){
+  const entries=Object.entries(applied);
+  const total=entries.length;
+  const interviews=entries.filter(([,a])=>a.status==="Interview").length;
+  const offers=entries.filter(([,a])=>a.status==="Offered").length;
+  const rejected=entries.filter(([,a])=>a.status==="Rejected").length;
+  const skillFreq={};
+  [...Object.keys(applied).map(Number),...saved].forEach(id=>{const j=jobs.find(j=>j.id===id);if(j)j.skills.forEach(s=>{skillFreq[s]=(skillFreq[s]||0)+1})});
+  const topSkills=Object.entries(skillFreq).sort((a,b)=>b[1]-a[1]).slice(0,8);
+  const barMax=Math.max(...topSkills.map(([,c])=>c),1);
+  const srcCount={};entries.forEach(([id])=>{const j=jobs.find(j=>j.id===Number(id));if(j)srcCount[j.source]=(srcCount[j.source]||0)+1});
+
+  return(
+    <div className="fu">
+      <h2 style={{fontSize:20,fontWeight:700,marginBottom:20}}>Application Insights</h2>
+      <div style={{...S.card,padding:24,marginBottom:18}}>
+        <h3 style={{fontSize:14,fontWeight:600,marginBottom:18}}>Application Funnel</h3>
+        <div style={{display:"flex",gap:0,alignItems:"flex-end",justifyContent:"center",minHeight:180}}>
+          {[{l:"Applied",v:total,c:"var(--c-blue)"},{l:"Interviewing",v:interviews,c:"var(--c-orange)"},{l:"Offered",v:offers,c:"var(--c-green)"},{l:"Rejected",v:rejected,c:"var(--c-red)"}].map((item,i)=>{const h=Math.max((item.v/Math.max(total,1))*140,8);return(
+            <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+              <span style={{fontSize:22,fontWeight:800,color:item.c}}>{item.v}</span>
+              <div style={{width:"60%",maxWidth:80,height:h,borderRadius:"8px 8px 0 0",background:item.c,opacity:.8,transition:"height .5s ease"}}></div>
+              <span style={{fontSize:10,fontWeight:600,color:"var(--c-text-muted)",textAlign:"center"}}>{item.l}</span>
+            </div>
+          )})}
+        </div>
+        {total>0&&<div style={{textAlign:"center",marginTop:16,fontSize:12,color:"var(--c-text-secondary)"}}>Response rate: <strong>{Math.round(((interviews+offers)/total)*100)}%</strong> · Offer rate: <strong>{Math.round((offers/total)*100)}%</strong></div>}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:18}}>
+        <div style={{...S.card,padding:24}}>
+          <h3 style={{fontSize:14,fontWeight:600,marginBottom:18}}>Most In-Demand Skills</h3>
+          {topSkills.length===0?<div style={{fontSize:12,color:"var(--c-text-muted)",textAlign:"center",padding:20}}>Save or apply to jobs to see trends</div>
+          :<div style={{display:"flex",flexDirection:"column",gap:10}}>{topSkills.map(([skill,count])=><div key={skill} style={{display:"flex",alignItems:"center",gap:12}}><span style={{fontSize:12,fontWeight:500,width:120,flexShrink:0}}>{skill}</span><div style={{flex:1,height:8,borderRadius:4,background:"var(--c-surface)",overflow:"hidden"}}><div style={{height:"100%",width:`${(count/barMax)*100}%`,borderRadius:4,background:"var(--c-accent)",transition:"width .5s ease"}}></div></div><span style={{fontSize:11,fontWeight:600,color:"var(--c-accent)",minWidth:20,textAlign:"right"}}>{count}</span></div>)}</div>}
+        </div>
+        <div style={{...S.card,padding:24}}>
+          <h3 style={{fontSize:14,fontWeight:600,marginBottom:18}}>Applications by Source</h3>
+          {Object.keys(srcCount).length===0?<div style={{fontSize:12,color:"var(--c-text-muted)",textAlign:"center",padding:20}}>Apply to jobs to see breakdown</div>
+          :<div style={{display:"flex",flexDirection:"column",gap:12}}>{Object.entries(srcCount).map(([src,cnt])=><div key={src} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",borderRadius:10,background:"var(--c-surface)"}}><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{width:8,height:8,borderRadius:"50%",background:src==="LinkedIn"?"#0a66c2":"#4285f4"}}></span><span style={{fontSize:13,fontWeight:500}}>{src}</span></div><span style={{fontSize:18,fontWeight:800,color:"var(--c-accent)"}}>{cnt}</span></div>)}</div>}
+          <div style={{marginTop:24,padding:16,borderRadius:10,background:"var(--c-accent-soft)",border:"1px solid var(--c-accent)"}}>
+            <h4 style={{fontSize:12,fontWeight:600,color:"var(--c-accent)",marginBottom:6}}>💡 Tip</h4>
+            <p style={{fontSize:11,color:"var(--c-text-secondary)",lineHeight:1.6}}>Connect LinkedIn and Google Jobs APIs for live job data and automatic tracking. See the API integration guide below the dashboard.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(JobSearchDashboard));
+</script>
+</body>
+</html>
